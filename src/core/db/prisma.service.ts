@@ -25,7 +25,6 @@ export class PrismaService
 
     super({
       adapter,
-      log: isProduction ? ['error', 'warn'] : ['query', 'error', 'warn'],
     });
 
     this.pool = pool;
