@@ -11,3 +11,46 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+enum BookingStatus {
+  CONFIRMED
+  BLOCKED_BY_BARBER
+  CANCELLED
+}
+
+model Service {
+  id          Int       @id @default(autoincrement())
+  nameRu      String
+  nameUz      String
+  price       Int     
+  durationMin Int       @default(30)
+  bookings    Booking[]
+}
+
+model Booking {
+  id               Int           @id @default(autoincrement())
+  clientTelegramId String
+  clientName       String?
+  clientPhone      String?
+  serviceId        Int?
+  service          Service?      @relation(fields: [serviceId], references: [id])
+  startTime        DateTime
+  endTime          DateTime
+  finalPrice       Int           @default(0)
+  discountPercent  Int           @default(0)
+  status           BookingStatus @default(CONFIRMED)
+  note             String?
+  createdAt        DateTime      @default(now())
+
+  @@index([startTime, endTime])
+}
+
+model ChatMessage {
+  id         Int      @id @default(autoincrement())
+  telegramId String
+  role       String
+  content    String
+  createdAt  DateTime @default(now())
+
+  @@index([telegramId, createdAt])
+}

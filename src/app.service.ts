@@ -1,4 +1,4 @@
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { conf } from './core';
@@ -19,8 +19,12 @@ export class App {
     }));
 
     app.enableCors({
-      origin: this.prod ? conf.CORS_ORIGINS : true, 
+      origin: this.prod
+        ? conf.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+        : true,
       credentials: true,
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key', 'x-telegram-init-data'],
+      methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     });
 
     app.setGlobalPrefix(this.api);
