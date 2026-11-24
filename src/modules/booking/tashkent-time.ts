@@ -87,17 +87,43 @@ export function tashkentLocalToUtc(
 }
 
 export function parseIsoToDate(value: string): Date {
-  if (
-    typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i.test(
-      value,
-    )
-  ) {
-    throw new Error('Invalid datetime');
+  const match =
+    typeof value === 'string'
+      ? /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/i.exec(
+          value,
+        )
+      : null;
+  if (!match) {
+    throw new Error(
+      'Invalid datetime. Use ISO 8601 with Z/+05:00, or omit the offset for Asia/Tashkent.',
+    );
   }
+
+  const [, dateOnly, hourText, minuteText, secondText = '0', millisText = '0', offset] = match;
+  const { year, month, day } = parseDateOnly(dateOnly);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const millisecond = Number(millisText.padEnd(3, '0'));
+  if (hour > 23 || minute > 59 || second > 59) {
+    throw new Error('Invalid datetime. Check the hour, minute, and second values.');
+  }
+
+  if (!offset) {
+    return tashkentLocalToUtc(
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second,
+      millisecond,
+    );
+  }
+
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    throw new Error('Invalid datetime');
+  if (!Number.isFinite(date.getTime())) {
+    throw new Error('Invalid datetime. Check the date and timezone offset.');
   }
   return date;
 }

@@ -21,6 +21,8 @@ export type BookingLike = {
   clientPhone?: string | null;
   clientTelegramId?: string;
   serviceId?: number | null;
+  barberId?: number | null;
+  barber?: { id: number; name: string; nameRu?: string | null; nameUz?: string | null } | null;
   finalPrice?: number;
   discountPercent?: number;
   note?: string | null;

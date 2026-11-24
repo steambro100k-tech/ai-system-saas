@@ -18,6 +18,13 @@ export class CreateBookingDto {
   @Min(1)
   serviceId!: number;
 
+  @ApiPropertyOptional({ example: 2, description: 'Preferred barber. Omit to assign the first available barber.' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  barberId?: number;
+
   @ApiProperty({
     example: '2026-11-24T05:00:00.000Z',
     description: 'Start time as ISO datetime (UTC instant)',

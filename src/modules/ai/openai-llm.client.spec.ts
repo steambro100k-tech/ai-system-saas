@@ -30,7 +30,6 @@ describe('OpenAiLlmClient', () => {
       apiKey: 'test-key',
       model: 'gemini-3.5-flash',
       fallbackModels: ['gemini-3.5-flash-lite'],
-      maxRetriesPerModel: 0,
       totalBudgetMs: 5000,
     });
     const create = jest

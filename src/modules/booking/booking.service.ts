@@ -34,10 +34,12 @@ import {
 type CreateBookingInput = {
   serviceId: number;
   startTimeIso: string;
+  barberId?: number;
   discountPercent?: number;
   clientTelegramId: string;
   clientName?: string;
   clientPhone?: string;
+  clientLang?: 'uz' | 'ru';
 };
 
 const ACTIVE_STATUSES: BookingStatus[] = ['CONFIRMED', 'BLOCKED_BY_BARBER'];
@@ -64,7 +66,15 @@ export class BookingService {
     return this.prisma.service.findMany({ orderBy: { id: 'asc' } });
   }
 
-  async getSlots(date?: string) {
+  async listBarbers() {
+    return this.prisma.barber.findMany({
+      where: { isActive: true },
+      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+      select: { id: true, name: true, nameRu: true, nameUz: true },
+    });
+  }
+
+  async getSlots(date?: string, barberId?: number) {
     let day: string;
     try {
       day = getDayBoundsUtc(date).date;
@@ -72,23 +82,36 @@ export class BookingService {
       throw new BadRequestException('Invalid date. Expected YYYY-MM-DD');
     }
     const { start: dayStart, end: dayEnd } = getDayBoundsUtc(day);
+    const barbers = await this.prisma.barber.findMany({
+      where: { isActive: true, ...(barberId ? { id: barberId } : {}) },
+      orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+    });
+    if (barberId && !barbers.length) throw new NotFoundException('Barber not found');
     const bookings = await this.prisma.booking.findMany({
       where: {
         status: { in: ACTIVE_STATUSES },
+        ...(barberId ? { barberId } : { barberId: { in: barbers.map((b) => b.id) } }),
         startTime: { lt: dayEnd },
         endTime: { gt: dayStart },
       },
-      include: { service: true },
+      include: { service: true, barber: true },
       orderBy: { startTime: 'asc' },
     });
 
     const slots = generateSlotStarts(day).map((slotStart) => {
       const slotEnd = addMinutes(slotStart, SLOT_STEP_MINUTES);
-      const { status, booking } = slotStatusForInterval(
-        slotStart,
-        slotEnd,
-        bookings as any,
-      );
+      const states = barbers.map((barber) => {
+        const barberBookings = bookings.filter((booking) => booking.barberId === barber.id);
+        const state = slotStatusForInterval(slotStart, slotEnd, barberBookings as any);
+        return { barber, ...state };
+      });
+      const freeBarberIds = states.filter((state) => state.status === 'FREE').map((state) => state.barber.id);
+      const selectedState = barberId ? states[0] : undefined;
+      const busyState = selectedState ?? states.find((state) => state.status !== 'FREE');
+      const status = barberId
+        ? (selectedState?.status ?? 'CONFIRMED')
+        : freeBarberIds.length > 0 ? 'FREE' : (busyState?.status ?? 'CONFIRMED');
+      const booking = status === 'FREE' ? null : (busyState?.booking ?? null);
       const offer = this.bargain.evaluate(slotStart, 100000);
       return {
         time: toTimeLabel(slotStart),
@@ -108,8 +131,13 @@ export class BookingService {
               discountPercent: booking.discountPercent,
               status: booking.status,
               note: (booking as any).note ?? null,
+              clientConfirmedAt: (booking as any).clientConfirmedAt?.toISOString() ?? null,
+              barber: booking.barber ? { id: booking.barber.id, name: booking.barber.name, nameRu: booking.barber.nameRu, nameUz: booking.barber.nameUz } : null,
             }
           : null,
+        barber: barberId && selectedState ? { id: selectedState.barber.id, name: selectedState.barber.name, nameRu: selectedState.barber.nameRu, nameUz: selectedState.barber.nameUz } : null,
+        freeBarberIds,
+        barberStatuses: barberId ? undefined : states.map((state) => ({ barberId: state.barber.id, barberName: state.barber.name, status: state.status })),
         offer: {
           canDiscount: offer.canDiscount,
           maxDiscountPercent: offer.maxDiscountPercent,
@@ -172,21 +200,34 @@ export class BookingService {
     try {
       const created = await this.prisma.$transaction(
         async (tx) => {
-          const conflicts = await tx.booking.findMany({
-            where: {
-              status: { in: ACTIVE_STATUSES },
-              startTime: { lt: end },
-              endTime: { gt: start },
-            },
+          const candidates = await tx.barber.findMany({
+            where: { isActive: true, ...(input.barberId ? { id: input.barberId } : {}) },
+            orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
           });
-          if (conflicts.length > 0) {
+          if (input.barberId && !candidates.length) throw new BadRequestException('Barber not found');
+          if (!candidates.length) throw new ConflictException('NO_ACTIVE_BARBERS');
+          let selectedBarber: (typeof candidates)[number] | undefined;
+          for (const candidate of candidates) {
+            const conflicts = await tx.booking.findMany({
+              where: {
+                barberId: candidate.id,
+                status: { in: ACTIVE_STATUSES },
+                startTime: { lt: end },
+                endTime: { gt: start },
+              },
+            });
+            if (!conflicts.length) { selectedBarber = candidate; break; }
+          }
+          if (!selectedBarber) {
             throw new ConflictException('SLOT_CONFLICT');
           }
           return tx.booking.create({
             data: {
+              barberId: selectedBarber.id,
               clientTelegramId: input.clientTelegramId,
               clientName: input.clientName ?? null,
               clientPhone: input.clientPhone ?? null,
+              clientLang: input.clientLang ?? null,
               serviceId: service.id,
               startTime: start,
               endTime: end,
@@ -194,7 +235,7 @@ export class BookingService {
               discountPercent: pricing.discountPercent,
               status: 'CONFIRMED',
             },
-            include: { service: true },
+            include: { service: true, barber: true },
           });
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -210,15 +251,26 @@ export class BookingService {
             finalPrice: created.finalPrice,
           }),
         );
-        await this.getNotifier()?.onBookingCreated(created);
+        const offer = this.bargain.evaluate(start, service.price);
+        let notifyResult;
+        try {
+          notifyResult = await this.getNotifier()?.onBookingCreated({
+            ...created,
+            bonusText: offer.bonus,
+          });
+        } catch (error: any) {
+          this.logger.warn(`booking_confirmation_delivery_failed code=${error?.code ?? error?.name ?? 'unknown'}`);
+        }
+        return { ...created, clientConfirmationSent: notifyResult?.clientConfirmationSent === true };
       }
-      return created;
+      return { ...created, clientConfirmationSent: false };
     } catch (e) {
       if (e instanceof ConflictException) {
         const alternatives = await this.findAlternativeSlots(
           start,
           service.durationMin,
           3,
+          input.barberId,
         );
         throw new ConflictException({
           message: 'Selected slot is not available',
@@ -236,6 +288,7 @@ export class BookingService {
           start,
           service.durationMin,
           3,
+          input.barberId,
         );
         throw new ConflictException({
           message: 'Selected slot is not available',
@@ -248,12 +301,15 @@ export class BookingService {
 
   async cancelBooking(
     id: number,
-    opts: { clientTelegramId?: string; allowPrivileged: boolean },
+    opts: { clientTelegramId?: string; allowPrivileged: boolean; barberId?: number },
   ) {
-    const booking = await this.prisma.booking.findUnique({ where: { id } });
+    const booking = await this.prisma.booking.findUnique({ where: { id }, include: { service: true, barber: true } });
     if (!booking) throw new NotFoundException('Booking not found');
 
-    if (!opts.allowPrivileged) {
+    if (opts.barberId !== undefined && opts.barberId !== booking.barberId) {
+      throw new ForbiddenException('Barbers can manage only their own schedule');
+    }
+    if (!opts.allowPrivileged && opts.barberId === undefined) {
       if (
         !opts.clientTelegramId ||
         opts.clientTelegramId !== booking.clientTelegramId
@@ -267,7 +323,7 @@ export class BookingService {
     const updated = await this.prisma.booking.update({
       where: { id },
       data: { status: 'CANCELLED' },
-      include: { service: true },
+      include: { service: true, barber: true },
     });
     if (updated.status === 'CANCELLED') {
       this.logger.log(
@@ -278,11 +334,50 @@ export class BookingService {
     return updated;
   }
 
+  async getClientReminderBooking(id: number, clientTelegramId: string) {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id, clientTelegramId, status: 'CONFIRMED', startTime: { gt: new Date() } },
+      include: { service: true, barber: true },
+    });
+    return booking ?? null;
+  }
+
+  async confirmClientBooking(id: number, clientTelegramId: string) {
+    const booking = await this.getClientReminderBooking(id, clientTelegramId);
+    if (!booking) return null;
+    if (!booking.clientConfirmedAt) {
+      await this.prisma.booking.updateMany({
+        where: { id, clientTelegramId, status: 'CONFIRMED', clientConfirmedAt: null, startTime: { gt: new Date() } },
+        data: { clientConfirmedAt: new Date() },
+      });
+    }
+    return this.getClientReminderBooking(id, clientTelegramId);
+  }
+
+  async cancelClientBookingFromReminder(id: number, clientTelegramId: string) {
+    const now = new Date();
+    const changed = await this.prisma.booking.updateMany({
+      where: { id, clientTelegramId, status: 'CONFIRMED', startTime: { gt: now } },
+      data: { status: 'CANCELLED' },
+    });
+    if (changed.count !== 1) return null;
+    const updated = await this.prisma.booking.findUnique({
+      where: { id },
+      include: { service: true, barber: true },
+    });
+    if (updated) await this.getNotifier()?.onBookingCancelled(updated);
+    return updated;
+  }
+
   async blockSlot(input: {
     startTimeIso: string;
+    barberId: number;
     durationMin?: number;
     note?: string;
-  }) {
+  }, actor: { barberId?: number; isAdmin: boolean }) {
+    const barber = await this.prisma.barber.findFirst({ where: { id: input.barberId, isActive: true } });
+    if (!barber) throw new NotFoundException('Barber not found');
+    if (!actor.isAdmin && actor.barberId !== barber.id) throw new ForbiddenException('Barbers can manage only their own schedule');
     let start: Date;
     try {
       start = parseStartTimeIso(input.startTimeIso);
@@ -312,6 +407,7 @@ export class BookingService {
         async (tx) => {
           const conflicts = await tx.booking.findMany({
             where: {
+              barberId: barber.id,
               status: { in: ACTIVE_STATUSES },
               startTime: { lt: end },
               endTime: { gt: start },
@@ -322,6 +418,7 @@ export class BookingService {
           }
           return tx.booking.create({
             data: {
+              barberId: barber.id,
               clientTelegramId: 'BARBER',
               serviceId: null,
               startTime: start,
@@ -351,13 +448,15 @@ export class BookingService {
     }
   }
 
-  async unblockSlot(id: number) {
-    const booking = await this.prisma.booking.findUnique({ where: { id } });
+  async unblockSlot(id: number, requestedBarberId: number, actor: { barberId?: number; isAdmin: boolean }) {
+    const booking = await this.prisma.booking.findUnique({ where: { id }, include: { barber: true } });
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.status !== 'BLOCKED_BY_BARBER') {
       throw new BadRequestException('Booking is not a barber block');
     }
-    return this.prisma.booking.delete({ where: { id } });
+    if (booking.barberId !== requestedBarberId) throw new BadRequestException('barberId does not match this blocked slot');
+    if (!actor.isAdmin && actor.barberId !== booking.barberId) throw new ForbiddenException('Barbers can manage only their own schedule');
+    return this.prisma.booking.delete({ where: { id }, include: { barber: true } });
   }
 
   async seedDemo() {
@@ -409,6 +508,20 @@ export class BookingService {
         await this.prisma.service.create({ data: s });
       }
     }
+    const barberTelegramId = getAppEnv().BARBER_TELEGRAM_IDS[0] || null;
+    const demoBarbers = [
+      { name: 'Jasur', nameUz: 'Jasur', sortOrder: 0, telegramId: barberTelegramId },
+      { name: 'Bobur', nameUz: 'Bobur', sortOrder: 1 },
+      { name: 'Sardor', nameUz: 'Sardor', sortOrder: 2 },
+    ];
+    for (const barber of demoBarbers) {
+      const { name, ...data } = barber;
+      await this.prisma.barber.upsert({
+        where: { name },
+        create: { name, ...data },
+        update: { ...data },
+      });
+    }
     return this.prisma.service.findMany({ orderBy: { id: 'asc' } });
   }
 
@@ -418,40 +531,43 @@ export class BookingService {
     }
     await this.prisma.chatMessage.deleteMany({});
     await this.prisma.booking.deleteMany({});
+    await this.prisma.barber.deleteMany({});
     await this.prisma.service.deleteMany({});
     return { ok: true };
   }
 
-  async findAlternativeSlots(start: Date, durationMin: number, limit: number) {
+  async findAlternativeSlots(start: Date, durationMin: number, limit: number, preferredBarberId?: number) {
     const date = formatTashkentDate(start);
     const { start: dayStart, end: dayEnd } = getDayBoundsUtc(date);
+    const barbers = await this.prisma.barber.findMany({
+      where: { isActive: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+    });
     const bookings = await this.prisma.booking.findMany({
       where: {
         status: { in: ACTIVE_STATUSES },
+        barberId: { in: barbers.map((barber) => barber.id) },
         startTime: { lt: dayEnd },
         endTime: { gt: dayStart },
       },
     });
     const candidates = generateSlotStarts(date)
-      .filter((s) => s.getTime() !== start.getTime())
       .filter((s) => canFitService(s, durationMin))
-      .filter((s) => s.getTime() > Date.now())
-      .filter(
-        (s) =>
-          !findOverlappingBooking(
-            s,
-            addMinutes(s, durationMin),
-            bookings as any,
-          ),
-      );
+      .filter((s) => s.getTime() > Date.now());
 
-    return candidates.slice(0, limit).map((s) => {
-      const offer = this.bargain.evaluate(s, 0);
-      return {
-        startTimeIso: s.toISOString(),
-        time: toTimeLabel(s),
-        maxDiscountPercent: offer.maxDiscountPercent,
-      };
-    });
+    const result: Array<Record<string, unknown>> = [];
+    for (const slot of candidates) {
+      const ordered = preferredBarberId
+        ? [...barbers.filter((b) => b.id !== preferredBarberId), ...barbers.filter((b) => b.id === preferredBarberId)]
+        : barbers;
+      for (const barber of ordered) {
+        if (slot.getTime() === start.getTime() && barber.id === preferredBarberId) continue;
+        const busy = findOverlappingBooking(slot, addMinutes(slot, durationMin), bookings.filter((b) => b.barberId === barber.id) as any);
+        if (busy) continue;
+        const offer = this.bargain.evaluate(slot, 100000);
+        result.push({ startTimeIso: slot.toISOString(), time: toTimeLabel(slot), barberId: barber.id, barberName: barber.name, maxDiscountPercent: offer.maxDiscountPercent });
+        if (result.length >= limit) return result;
+      }
+    }
+    return result;
   }
 }

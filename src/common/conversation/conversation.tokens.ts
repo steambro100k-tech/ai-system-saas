@@ -4,6 +4,7 @@ export type ConversationInput = {
   telegramId: string;
   text: string;
   languageCode?: string;
+  firstName?: string;
   contactPhone?: string;
 };
 

@@ -10,6 +10,12 @@ import {
 } from 'class-validator';
 
 export class BlockSlotDto {
+  @ApiProperty({ example: 1 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  barberId!: number;
+
   @ApiProperty({ example: '2026-11-24T05:00:00.000Z' })
   @IsISO8601()
   startTimeIso!: string;

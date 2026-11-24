@@ -213,6 +213,9 @@ export class OpenAiLlmClient implements LlmClient {
             status === 'timeout' ||
             (typeof status === 'number' && status >= 500 && status <= 599);
           if (retryableTransient) {
+            // A quota response will not improve by immediately repeating the same
+            // request. Preserve the remaining request budget for the fallback model.
+            if (mi < models.length - 1) break;
             if (attempt < attempts - 1 && deadline - Date.now() > 1200) {
               await sleep(jitter(700));
               continue;

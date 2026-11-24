@@ -2,9 +2,11 @@ import { Global, Module } from '@nestjs/common';
 import { BOOKING_NOTIFIER } from '../booking/booking-notifier';
 import { TelegramController } from './telegram.controller';
 import { TelegramService } from './telegram.service';
+import { BookingModule } from '../booking/booking.module';
 
 @Global()
 @Module({
+  imports: [BookingModule],
   controllers: [TelegramController],
   providers: [
     TelegramService,

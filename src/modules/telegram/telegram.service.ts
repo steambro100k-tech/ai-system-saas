@@ -15,6 +15,8 @@ import {
 import { InMemoryRateLimiter } from './rate-limiter';
 import { getTashkentParts } from '../booking/tashkent-time';
 import { resolveTelegramWebhookUrl } from './telegram-webhook-url';
+import { BookingService } from '../booking/booking.service';
+import { BookingMessageService } from '../booking/booking-message.service';
 
 @Injectable()
 export class TelegramService
@@ -24,10 +26,13 @@ export class TelegramService
   private bot?: Bot;
   private readonly rateLimiter = new InMemoryRateLimiter(20, 60_000);
   private pollingStarted = false;
+  private readonly pendingCancellationConfirmations = new Map<string, number>();
 
   constructor(
     @Inject(CONVERSATION_HANDLER)
     private readonly conversation: ConversationHandler,
+    private readonly bookingService: BookingService,
+    private readonly bookingMessages: BookingMessageService,
   ) {}
 
   async onModuleInit() {
@@ -97,12 +102,45 @@ export class TelegramService
     await this.bot.api.setWebhook(url, { secret_token: secretToken });
   }
 
-  async onBookingCreated(booking: any): Promise<void> {
-    await this.notifyBarbers(this.formatBookingCreated(booking));
+  async onBookingCreated(booking: any): Promise<{ clientConfirmationSent: boolean }> {
+    await this.notifyBarbers(this.formatBookingCreated(booking), booking.barber?.telegramId);
+    return { clientConfirmationSent: await this.sendClientConfirmation(booking) };
   }
 
   async onBookingCancelled(booking: any): Promise<void> {
-    await this.notifyBarbers(this.formatBookingCancelled(booking));
+    await this.notifyBarbers(this.formatBookingCancelled(booking), booking.barber?.telegramId);
+  }
+
+  async sendClientConfirmation(booking: any): Promise<boolean> {
+    if (!this.bot) return false;
+    try {
+      await this.bot.api.sendMessage(
+        booking.clientTelegramId,
+        this.bookingMessages.renderConfirmation(booking, getAppEnv().SHOP_ADDRESS),
+        { parse_mode: 'HTML' },
+      );
+      return true;
+    } catch (error: any) {
+      this.logger.warn(`telegram_client_confirmation_failed status=${error?.error?.error_code ?? error?.status ?? 'unknown'}`);
+      return false;
+    }
+  }
+
+  async sendClientReminder(booking: any): Promise<void> {
+    if (!this.bot) {
+      const error: any = new Error('Telegram bot is not initialized');
+      error.code = 'ECONNABORTED';
+      throw error;
+    }
+    const lang = booking.clientLang === 'ru' ? 'ru' : 'uz';
+    const keyboard = new InlineKeyboard()
+      .text(lang === 'ru' ? '✅ Приду' : '✅ Kelaman', `confirm:${booking.id}`)
+      .text(lang === 'ru' ? '❌ Отменить' : '❌ Bekor qilish', `cancel:${booking.id}`);
+    await this.bot.api.sendMessage(
+      booking.clientTelegramId,
+      this.bookingMessages.renderReminder(booking, new Date()),
+      { parse_mode: 'HTML', reply_markup: keyboard },
+    );
   }
 
   private registerHandlers() {
@@ -145,6 +183,7 @@ export class TelegramService
         telegramId: userId,
         text: '[contact shared]',
         languageCode: ctx.from?.language_code,
+        firstName: ctx.from?.first_name,
         contactPhone: phone,
       });
       await ctx.reply(reply);
@@ -176,6 +215,7 @@ export class TelegramService
           telegramId: userId,
           text: ctx.message.text,
           languageCode: ctx.from?.language_code,
+          firstName: ctx.from?.first_name,
         });
         await ctx.reply(reply);
       } catch {
@@ -185,12 +225,104 @@ export class TelegramService
         );
       }
     });
+
+    this.bot.on('callback_query:data', async (ctx) => {
+      const data = ctx.callbackQuery.data;
+      const [action, idText] = data.split(':');
+      const bookingId = /^\d+$/.test(idText ?? '') ? Number(idText) : NaN;
+      const telegramId = String(ctx.from.id);
+      try {
+        if (!Number.isSafeInteger(bookingId) || bookingId <= 0) {
+          await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+          return;
+        }
+        if (action === 'confirm') {
+          const booking = await this.bookingService.confirmClientBooking(bookingId, telegramId);
+          if (!booking) {
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          await ctx.answerCallbackQuery();
+          const lang = booking.clientLang === 'ru' ? 'ru' : 'uz';
+          await ctx.editMessageText(lang === 'ru' ? 'Спасибо, будем ждать! ✅' : 'Rahmat, kutamiz! ✅', {
+            reply_markup: { inline_keyboard: [] },
+          });
+          return;
+        }
+        if (action === 'cancel') {
+          const booking = await this.bookingService.getClientReminderBooking(bookingId, telegramId);
+          if (!booking) {
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          await ctx.answerCallbackQuery();
+          const lang = booking.clientLang === 'ru' ? 'ru' : 'uz';
+          this.pendingCancellationConfirmations.set(`${telegramId}:${bookingId}`, Date.now() + 5 * 60_000);
+          const keyboard = new InlineKeyboard()
+            .text(lang === 'ru' ? 'Да' : 'Ha', `cancel_yes:${bookingId}`)
+            .text(lang === 'ru' ? 'Нет' : "Yo'q", `cancel_no:${bookingId}`);
+          await ctx.editMessageText(this.bookingMessages.renderReminderCancelQuestion(lang), {
+            reply_markup: keyboard,
+          });
+          return;
+        }
+        if (action === 'cancel_yes') {
+          const confirmationKey = `${telegramId}:${bookingId}`;
+          const expiresAt = this.pendingCancellationConfirmations.get(confirmationKey);
+          if (!expiresAt || expiresAt < Date.now()) {
+            this.pendingCancellationConfirmations.delete(confirmationKey);
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          this.pendingCancellationConfirmations.delete(confirmationKey);
+          const booking = await this.bookingService.cancelClientBookingFromReminder(bookingId, telegramId);
+          if (!booking) {
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          await ctx.answerCallbackQuery();
+          const lang = booking.clientLang === 'ru' ? 'ru' : 'uz';
+          await ctx.editMessageText(lang === 'ru' ? 'Запись отменена.' : 'Yozilishingiz bekor qilindi.', {
+            reply_markup: { inline_keyboard: [] },
+          });
+          return;
+        }
+        if (action === 'cancel_no') {
+          const confirmationKey = `${telegramId}:${bookingId}`;
+          if (!this.pendingCancellationConfirmations.has(confirmationKey)) {
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          this.pendingCancellationConfirmations.delete(confirmationKey);
+          const booking = await this.bookingService.getClientReminderBooking(bookingId, telegramId);
+          if (!booking) {
+            await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+            return;
+          }
+          await ctx.answerCallbackQuery();
+          const lang = booking.clientLang === 'ru' ? 'ru' : 'uz';
+          await ctx.editMessageText(lang === 'ru' ? 'Хорошо, запись остаётся.' : 'Yaxshi, yozilishingiz qoldirildi.', {
+            reply_markup: { inline_keyboard: [] },
+          });
+          return;
+        }
+        await ctx.answerCallbackQuery();
+      } catch (error: any) {
+        this.logger.warn(`telegram_booking_callback_failed action=${action} code=${error?.error?.error_code ?? error?.code ?? 'unknown'}`);
+        try {
+          await ctx.answerCallbackQuery({ text: 'This reminder is no longer active.' });
+        } catch {
+          // Ignore expired Telegram callback query ids.
+        }
+      }
+    });
   }
 
-  private async notifyBarbers(text: string) {
+  private async notifyBarbers(text: string, assignedBarberTelegramId?: string | null) {
     if (!this.bot) return;
     const env = getAppEnv();
-    for (const id of env.BARBER_TELEGRAM_IDS) {
+    const ids = new Set([...env.BARBER_TELEGRAM_IDS, ...(assignedBarberTelegramId ? [assignedBarberTelegramId] : [])].map(String));
+    for (const id of ids) {
       if (!id) continue;
       try {
         await this.bot.api.sendMessage(id, text);
@@ -208,9 +340,11 @@ export class TelegramService
       booking.service?.nameRu ||
       booking.service?.nameUz ||
       `Service #${booking.serviceId ?? '-'}`;
+    const barberName = booking.barber?.nameUz || booking.barber?.name || '-';
     return (
       `New booking confirmed\n` +
       `Service: ${serviceName}\n` +
+      `Master: ${barberName}\n` +
       `Time: ${date} ${time} (Asia/Tashkent)\n` +
       `Price: ${booking.finalPrice} UZS\n` +
       `Discount: ${booking.discountPercent}%\n` +
@@ -226,10 +360,14 @@ export class TelegramService
       booking.service?.nameRu ||
       booking.service?.nameUz ||
       `Service #${booking.serviceId ?? '-'}`;
+    const barberName = booking.barber?.nameUz || booking.barber?.name || '-';
     return (
       `Booking cancelled\n` +
       `Service: ${serviceName}\n` +
+      `Master: ${barberName}\n` +
       `Time: ${date} ${time} (Asia/Tashkent)\n` +
+      `Price: ${booking.finalPrice} UZS\n` +
+      `Discount: ${booking.discountPercent}%\n` +
       `Client: ${booking.clientName ?? '-'} (${booking.clientTelegramId})`
     );
   }

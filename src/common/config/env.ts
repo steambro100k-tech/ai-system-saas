@@ -18,6 +18,8 @@ export type AppEnv = {
   ADMIN_KEY: string;
   MINI_APP_URL: string;
   NODE_ENV: string;
+  SHOP_ADDRESS: string;
+  REMINDER_LEAD_MIN: number;
 };
 
 function read(name: string, fallback = ''): string {
@@ -71,6 +73,8 @@ export function getAppEnv(): AppEnv {
     ADMIN_KEY: read('ADMIN_KEY'),
     MINI_APP_URL: read('MINI_APP_URL'),
     NODE_ENV: read('NODE_ENV', 'dev'),
+    SHOP_ADDRESS: read('SHOP_ADDRESS'),
+    REMINDER_LEAD_MIN: readInt('REMINDER_LEAD_MIN', 120),
   };
 }
 
