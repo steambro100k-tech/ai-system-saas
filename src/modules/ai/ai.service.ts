@@ -96,6 +96,17 @@ function getMemoryLimit(): number {
   return Number.isInteger(value) && value >= 10 && value <= 50 ? value : 20;
 }
 
+function isBarberListRequest(text: string): boolean {
+  const normalized = text
+    .toLocaleLowerCase()
+    .replace(/[ʻʼ`’']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const mentionsBarber = /\b(usta|ustalar|ustalarni|ustalarimiz|master|masters|барбер|барберы|мастер|мастера|мастеров)\b/i.test(normalized);
+  const asksForList = /\b(ro'yxat|ruyxat|royxat|ro'yxatini|ruyxatini|royxatini|list|список|имена|kimlar)\b/i.test(normalized);
+  return mentionsBarber && asksForList;
+}
+
 @Injectable()
 export class AiService implements ConversationHandler {
   private readonly logger = new Logger(AiService.name);
@@ -130,6 +141,22 @@ export class AiService implements ConversationHandler {
       await this.prisma.chatMessage.create({
         data: { telegramId: input.telegramId, role: 'user', content: userText },
       });
+
+      if (isBarberListRequest(input.text ?? '')) {
+        const barbers = await this.bookingService.listBarbers();
+        const isRussian = /[\u0400-\u04ff]/.test(input.text ?? '');
+        const reply = barbers.length
+          ? isRussian
+            ? `Наши мастера:\n${barbers.map((barber: any) => `• ${barber.nameRu || barber.name}`).join('\n')}`
+            : `Ustalarimiz:\n${barbers.map((barber: any) => `• ${barber.nameUz || barber.name}`).join('\n')}`
+          : isRussian
+            ? 'Сейчас список мастеров недоступен. Напишите нам немного позже.'
+            : "Hozircha faol ustalar ro'yxati topilmadi. Iltimos, keyinroq yozing.";
+        await this.prisma.chatMessage.create({
+          data: { telegramId: input.telegramId, role: 'assistant', content: reply },
+        });
+        return reply;
+      }
 
       const history = await this.prisma.chatMessage.findMany({
         where: {
