@@ -1,4 +1,5 @@
 export type AppEnv = {
+  TELEGRAM_ENABLED: boolean;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   TELEGRAM_WEBHOOK_URL: string;
@@ -52,6 +53,7 @@ export function getAppEnv(): AppEnv {
   const reasoningEffortRaw = read('GEMINI_REASONING_EFFORT', 'low').trim();
 
   return {
+    TELEGRAM_ENABLED: read('TELEGRAM_ENABLED', 'true').trim().toLowerCase() !== 'false',
     TELEGRAM_BOT_TOKEN: read('TELEGRAM_BOT_TOKEN'),
     TELEGRAM_WEBHOOK_SECRET: read('TELEGRAM_WEBHOOK_SECRET'),
     TELEGRAM_WEBHOOK_URL: read('TELEGRAM_WEBHOOK_URL'),

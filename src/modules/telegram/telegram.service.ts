@@ -17,6 +17,7 @@ import { getTashkentParts } from '../booking/tashkent-time';
 import { resolveTelegramWebhookUrl } from './telegram-webhook-url';
 import { BookingService } from '../booking/booking.service';
 import { BookingMessageService } from '../booking/booking-message.service';
+import { PrismaService } from '../../core/db/prisma.service';
 
 @Injectable()
 export class TelegramService
@@ -33,16 +34,25 @@ export class TelegramService
     private readonly conversation: ConversationHandler,
     private readonly bookingService: BookingService,
     private readonly bookingMessages: BookingMessageService,
+    private readonly prisma: PrismaService,
   ) {}
 
   async onModuleInit() {
     const env = getAppEnv();
+    if (!env.TELEGRAM_ENABLED) {
+      this.logger.log('Telegram integration disabled by TELEGRAM_ENABLED');
+      return;
+    }
     if (!env.TELEGRAM_BOT_TOKEN) {
       this.logger.warn('TELEGRAM_BOT_TOKEN is not set; Telegram bot disabled');
       return;
     }
 
     this.bot = new Bot(env.TELEGRAM_BOT_TOKEN);
+    this.bot.catch((error) => {
+      const status = (error.error as any)?.error_code ?? 'unknown';
+      this.logger.error(`telegram_update_failed status=${status}`);
+    });
     this.registerHandlers();
 
     if (env.NODE_ENV === 'production') {
@@ -149,20 +159,38 @@ export class TelegramService
     const barberIds = new Set(env.BARBER_TELEGRAM_IDS.map(String));
 
     this.bot.command('start', async (ctx) => {
-      const isBarber = barberIds.has(String(ctx.from?.id ?? ''));
-      const greeting =
-        'Assalomu alaykum! SavdoAI barbershop qabulxonasiga xush kelibsiz.\n' +
-        '\u0417\u0434\u0440\u0430\u0432\u0441\u0442\u0432\u0443\u0439\u0442\u0435! \u0414\u043e\u0431\u0440\u043e \u043f\u043e\u0436\u0430\u043b\u043e\u0432\u0430\u0442\u044c \u0432 \u0431\u0430\u0440\u0431\u0435\u0440\u0448\u043e\u043f SavdoAI.\n\n' +
-        'Iltimos, xabar yozing (RU/UZ). / \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 (RU/UZ).';
+      const languageKeyboard = new InlineKeyboard()
+        .text('🇺🇿 O‘zbekcha', 'lang:uz')
+        .text('🇷🇺 Русский', 'lang:ru');
+      await ctx.reply('Tilni tanlang / Выберите язык:', { reply_markup: languageKeyboard });
+      return;
 
-      if (isBarber && env.MINI_APP_URL) {
-        const kb = new InlineKeyboard().webApp(
-          'Open Barber Mini App',
-          env.MINI_APP_URL,
-        );
-        await ctx.reply(greeting, { reply_markup: kb });
+      const isBarber = barberIds.has(String(ctx.from?.id ?? ''));
+      const lang = ctx.from?.language_code?.toLowerCase().startsWith('ru') ? 'ru' : 'uz';
+      const miniAppUrl = this.getHttpsMiniAppUrl(env.MINI_APP_URL ?? '');
+      if (isBarber && miniAppUrl) {
+        const text = lang === 'ru'
+          ? '👋 Добро пожаловать в SavdoAI, мастер!\n\nЗдесь вы можете следить за записями и расписанием. Откройте панель, чтобы посмотреть свой день.'
+          : '👋 SavdoAI’ga xush kelibsiz, usta!\n\nYozuvlaringiz va ish jadvalingizni shu yerdan kuzatib boring. Bugungi jadvalni ochish uchun tugmani bosing.';
+        const kb = new InlineKeyboard().webApp(lang === 'ru' ? '📊 Открыть расписание' : '📊 Jadvalni ochish', miniAppUrl!);
+        await ctx.reply(text, { reply_markup: kb });
       } else {
-        await ctx.reply(greeting);
+        if (isBarber && env.MINI_APP_URL) {
+          this.logger.warn('mini_app_url_invalid_or_not_https');
+        }
+        if (isBarber) {
+          await ctx.reply(lang === 'ru'
+            ? '👋 Добро пожаловать в SavdoAI, мастер! Сейчас панель расписания недоступна. Напишите администратору, чтобы получить ссылку.'
+            : '👋 SavdoAI’ga xush kelibsiz, usta! Hozircha jadval paneli havolasi mavjud emas. Havola uchun administratorga yozing.');
+          return;
+        }
+        const text = lang === 'ru'
+          ? '👋 Здравствуйте, ' + (ctx.from?.first_name?.trim() || 'друг') + '!\nДобро пожаловать в SavdoAI Barbershop.\n\nПодберу услугу, мастера и удобное время, расскажу о цене и доступных предложениях.\n\nС чего начнём?'
+          : '👋 Assalomu alaykum, ' + (ctx.from?.first_name?.trim() || 'aziz mehmon') + '!\nSavdoAI Barbershop’ga xush kelibsiz.\n\nSizga xizmat, usta va qulay vaqt tanlashda yordam beraman. Narx va mavjud takliflarni ham shu yerda bilib olasiz.\n\nNimadan boshlaymiz?';
+        const keyboard = lang === 'ru'
+          ? new InlineKeyboard().text('💈 Мастера', 'start:barbers').text('📅 Свободное время', 'start:slots')
+          : new InlineKeyboard().text('💈 Ustalarni ko‘rish', 'start:barbers').text('📅 Bo‘sh vaqtlar', 'start:slots');
+        await ctx.reply(text, { reply_markup: keyboard });
       }
     });
 
@@ -182,7 +210,7 @@ export class TelegramService
       const reply = await this.conversation.handleMessage({
         telegramId: userId,
         text: '[contact shared]',
-        languageCode: ctx.from?.language_code,
+        languageCode: await this.getPreferredLanguage(userId) ?? ctx.from?.language_code,
         firstName: ctx.from?.first_name,
         contactPhone: phone,
       });
@@ -214,7 +242,7 @@ export class TelegramService
         const reply = await this.conversation.handleMessage({
           telegramId: userId,
           text: ctx.message.text,
-          languageCode: ctx.from?.language_code,
+          languageCode: await this.getPreferredLanguage(userId) ?? ctx.from?.language_code,
           firstName: ctx.from?.first_name,
         });
         await ctx.reply(reply);
@@ -229,6 +257,59 @@ export class TelegramService
     this.bot.on('callback_query:data', async (ctx) => {
       const data = ctx.callbackQuery.data;
       const [action, idText] = data.split(':');
+      if (action === 'lang' && (idText === 'uz' || idText === 'ru')) {
+        const lang = idText;
+        const telegramId = String(ctx.from.id);
+        try {
+          await this.prisma.chatMessage.create({
+            data: { telegramId, role: 'language_preference', content: lang },
+          });
+          await ctx.answerCallbackQuery({ text: lang === 'ru' ? 'Язык сохранён' : 'Til saqlandi' });
+          if (barberIds.has(telegramId)) {
+            const appUrl = this.getHttpsMiniAppUrl(env.MINI_APP_URL ?? '');
+            const text = lang === 'ru'
+              ? '👋 Добро пожаловать в SavdoAI, мастер! Здесь вы можете следить за записями и расписанием.'
+              : '👋 SavdoAI’ga xush kelibsiz, usta! Yozuvlaringiz va ish jadvalingizni shu yerdan kuzatib boring.';
+            if (appUrl) {
+              const keyboard = new InlineKeyboard().webApp(lang === 'ru' ? '📊 Открыть расписание' : '📊 Jadvalni ochish', appUrl);
+              await ctx.reply(text, { reply_markup: keyboard });
+            } else {
+              await ctx.reply(text);
+            }
+            return;
+          }
+          const welcome = lang === 'ru'
+            ? `👋 Здравствуйте, ${ctx.from.first_name?.trim() || 'друг'}!\nДобро пожаловать в SavdoAI Barbershop.\n\nПомогу выбрать услугу, мастера и удобное время, а также подскажу цену и доступные предложения.\n\nС чего начнём?`
+            : `👋 Assalomu alaykum, ${ctx.from.first_name?.trim() || 'aziz mehmon'}!\nSavdoAI Barbershop’ga xush kelibsiz.\n\nXizmat, usta va qulay vaqt tanlashda yordam beraman. Narxlar va takliflarni ham shu yerda bilib olasiz.\n\nNimadan boshlaymiz?`;
+          const keyboard = lang === 'ru'
+            ? new InlineKeyboard().text('💈 Мастера', 'start:barbers').text('📅 Свободное время', 'start:slots')
+            : new InlineKeyboard().text('💈 Ustalarni ko‘rish', 'start:barbers').text('📅 Bo‘sh vaqtlar', 'start:slots');
+          await ctx.reply(welcome, { reply_markup: keyboard });
+        } catch (error: any) {
+          this.logger.warn(`telegram_language_save_failed code=${error?.code ?? 'unknown'}`);
+          await ctx.answerCallbackQuery({ text: lang === 'ru' ? 'Не удалось сохранить язык' : 'Tilni saqlab bo‘lmadi' });
+        }
+        return;
+      }
+      if (action === 'start') {
+        const lang = await this.getPreferredLanguage(String(ctx.from.id)) ?? (ctx.from.language_code?.toLowerCase().startsWith('ru') ? 'ru' : 'uz');
+        const text = idText === 'barbers'
+          ? (lang === 'ru' ? 'Покажите список мастеров' : 'Ustalar ro‘yxatini ko‘rsating')
+          : (lang === 'ru' ? 'Какие есть свободные слоты на сегодня?' : 'Bugun bo‘sh vaqtlar bormi?');
+        await ctx.answerCallbackQuery();
+        try {
+          const reply = await this.conversation.handleMessage({
+            telegramId: String(ctx.from.id), text, languageCode: lang,
+            firstName: ctx.from.first_name,
+          });
+          await ctx.reply(reply);
+        } catch {
+          await ctx.reply(lang === 'ru'
+            ? 'Не удалось загрузить информацию. Напишите, пожалуйста, ещё раз.'
+            : 'Ma’lumotni hozir yuklay olmadim. Iltimos, yana bir bor yozib yuboring.');
+        }
+        return;
+      }
       const bookingId = /^\d+$/.test(idText ?? '') ? Number(idText) : NaN;
       const telegramId = String(ctx.from.id);
       try {
@@ -316,6 +397,26 @@ export class TelegramService
         }
       }
     });
+  }
+
+  private getHttpsMiniAppUrl(value: string): string | undefined {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' ? url.toString() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getPreferredLanguage(telegramId: string): Promise<'uz' | 'ru' | undefined> {
+    const preference = await this.prisma.chatMessage.findFirst({
+      where: { telegramId, role: 'language_preference' },
+      orderBy: { createdAt: 'desc' },
+      select: { content: true },
+    });
+    return preference?.content === 'uz' || preference?.content === 'ru'
+      ? preference.content
+      : undefined;
   }
 
   private async notifyBarbers(text: string, assignedBarberTelegramId?: string | null) {
