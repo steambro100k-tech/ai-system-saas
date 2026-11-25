@@ -41,7 +41,7 @@ export class BarberOrAdminGuard implements CanActivate {
       const res = validateTelegramInitData({
         botToken: env.TELEGRAM_BOT_TOKEN,
         initData,
-        allowedTelegramIds: env.BARBER_TELEGRAM_IDS,
+        allowedTelegramIds: [...env.BARBER_TELEGRAM_IDS, ...env.ADMIN_TELEGRAM_IDS],
       });
       if (res.ok) {
         (req as any).telegramUser = res.value.user;

@@ -5,7 +5,7 @@ NestJS + Prisma API and Telegram receptionist for a Tashkent barbershop. The app
 ## Local setup
 
 1. Install Node.js 20.19+ and pnpm, then run `pnpm install`.
-2. Copy `.env.example` to `.env` and set `DATABASE_URL`, `OPENAI_API_KEY`, and the Telegram settings you use locally. Set `BARBER_TELEGRAM_IDS` to comma-separated Telegram numeric IDs and `ADMIN_KEY` to a long random value.
+2. Copy `.env.example` to `.env` and set `DATABASE_URL`, `OPENAI_API_KEY`, and the Telegram settings you use locally. Set `BARBER_TELEGRAM_IDS` and `ADMIN_TELEGRAM_IDS` to comma-separated Telegram numeric IDs and `ADMIN_KEY` to a long random value.
 3. Apply migrations and create the demo services:
 
    ```sh
@@ -19,7 +19,7 @@ The bot uses long polling in development. In production, set `NODE_ENV=productio
 
 ## Barber Mini App API
 
-Set `MINI_APP_URL` and add the Mini App's origin to `CORS_ORIGINS`. Barber endpoints accept signed Telegram Mini App data in `x-telegram-init-data`; `x-admin-key` is available for controlled admin access.
+Set `MINI_APP_URL` and add the Mini App's origin to `CORS_ORIGINS`. In local development, Telegram requires an HTTPS Mini App URL; expose the Vite server (port 5173) through an HTTPS tunnel and set that URL as `MINI_APP_URL`. For local desktop testing, allow the tunnel origin in `CORS_ORIGINS`; the Mini App API base URL must still reach the local backend on port 3000. Add the owner's Telegram numeric ID to `ADMIN_TELEGRAM_IDS`; `/start` then offers an admin button that opens the Mini App. Barber endpoints accept signed Telegram Mini App data in `x-telegram-init-data`; `x-admin-key` is available for controlled admin access.
 
 - `GET /api/v1/bookings/services` lists services.
 - `GET /api/v1/bookings/slots?date=YYYY-MM-DD` returns the day's 30-minute slots and booking details.

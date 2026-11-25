@@ -23,12 +23,15 @@ type PendingBookingConfirmation = {
   serviceId: number;
   serviceNameRu: string;
   serviceNameUz: string;
+  basePrice: number;
   startTimeIso: string;
   barberId: number;
   barberName: string;
   discountPercent: number;
   finalPrice: number;
+  bonus: string | null;
   expiresAt: number;
+  confirmed?: boolean;
 };
 
 class LlmTransportFailure extends Error {
@@ -41,6 +44,35 @@ function isAffirmative(text: string): boolean {
   return /^(ha|xa|yes|yeah|yep|ok|okay|mayli|tasdiqlayman|tasdiqlay|bo'?ladi|да|подтверждаю|подтверждаю|записывайте)(?:[\s,.!?].{0,40})?$/iu.test(
     text.trim(),
   );
+}
+
+function looksLikePhoneNumber(text: string): boolean {
+  const trimmed = text.trim();
+  const digits = trimmed.replace(/\D/g, '');
+  return digits.length >= 9 && digits.length <= 15 && /^[+\d\s().-]+$/.test(trimmed);
+}
+
+function renderOfferConfirmation(offer: PendingBookingConfirmation, lang: 'uz' | 'ru'): string {
+  const start = parseStartTimeIso(offer.startTimeIso);
+  const date = new Intl.DateTimeFormat(lang === 'ru' ? 'ru-RU' : 'uz-UZ', {
+    timeZone: 'Asia/Tashkent', day: 'numeric', month: 'long',
+  }).format(start);
+  const parts = getTashkentParts(start);
+  const time = `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
+  const money = (value: number) => `${new Intl.NumberFormat(lang === 'ru' ? 'ru-RU' : 'uz-UZ').format(value)} ${lang === 'ru' ? 'сум' : 'so‘m'}`;
+  const service = lang === 'ru' ? offer.serviceNameRu : offer.serviceNameUz;
+  if (lang === 'ru') {
+    const lines = [`${offer.barberName} — ${date}, ${time}`, `Услуга: ${service}`, `Цена: ${money(offer.basePrice)}`];
+    if (offer.discountPercent > 0) lines.push(`Скидка: ${offer.discountPercent}% · Итого: ${money(offer.finalPrice)}`);
+    if (offer.bonus) lines.push(`🎁 Бонус: ${offer.bonus}`);
+    lines.push('', 'Подтвердите запись на это время?');
+    return lines.join('\n');
+  }
+  const lines = [`${offer.barberName} usta bilan ${date}, soat ${time}`, `Xizmat: ${service}`, `Narxi: ${money(offer.basePrice)}`];
+  if (offer.discountPercent > 0) lines.push(`${offer.discountPercent}% chegirma · Yakuniy narx: ${money(offer.finalPrice)}`);
+  if (offer.bonus) lines.push(`🎁 Bonus: ${offer.bonus}`);
+  lines.push('', 'Shu vaqtga band qilaylikmi?');
+  return lines.join('\n');
 }
 
 function normalizePhrase(value: string): string {
@@ -151,12 +183,67 @@ export class AiService implements ConversationHandler {
       });
 
       const pending = await this.loadPendingConfirmation(input.telegramId);
-      confirmedOffer =
-        pending && pending.expiresAt > Date.now() && isAffirmative(userText)
+      const pendingIsValid = Boolean(pending && pending.expiresAt > Date.now());
+      confirmedOffer = pendingIsValid && pending && isAffirmative(userText)
+        ? { ...pending, confirmed: true }
+        : pendingIsValid && pending?.confirmed && input.contactPhone
           ? pending
           : undefined;
-      if (pending && !confirmedOffer) {
+      if (confirmedOffer?.confirmed && isAffirmative(userText)) {
+        await this.savePendingConfirmation(input.telegramId, confirmedOffer);
+      }
+      if (pending && !pendingIsValid) {
         await this.clearPendingConfirmation(input.telegramId);
+      } else if (pending && !confirmedOffer && !pending.confirmed) {
+        await this.clearPendingConfirmation(input.telegramId);
+      }
+
+      if (confirmedOffer?.confirmed || (pending?.confirmed && pendingIsValid && !input.contactPhone && looksLikePhoneNumber(input.text ?? ''))) {
+        if (!input.contactPhone) {
+          const reply = input.languageCode?.toLowerCase().startsWith('ru')
+            ? 'Чтобы мастер мог связаться с вами, отправьте свой номер кнопкой «📱 Отправить контакт» ниже.'
+            : 'Usta siz bilan bog‘lanishi uchun pastdagi «📱 Kontaktni yuborish» tugmasini bosing.';
+          await this.prisma.chatMessage.create({
+            data: { telegramId: input.telegramId, role: 'assistant', content: reply },
+          });
+          return reply;
+        }
+
+        const offerToBook = confirmedOffer ?? (pending?.confirmed ? pending : undefined);
+        if (!offerToBook) return this.internalFailureReply(input.languageCode);
+
+        let result: Awaited<ReturnType<BookingService['createBooking']>>;
+        try {
+          result = await this.bookingService.createBooking({
+            serviceId: offerToBook.serviceId,
+            barberId: offerToBook.barberId,
+            startTimeIso: offerToBook.startTimeIso,
+            discountPercent: offerToBook.discountPercent,
+            clientTelegramId: input.telegramId,
+            clientName: input.firstName,
+            clientPhone: input.contactPhone,
+            clientLang: input.languageCode?.toLowerCase().startsWith('ru') ? 'ru' : 'uz',
+          });
+        } catch (error) {
+          this.logger.warn(`ai_confirmed_booking_failed code=${this.safeErrorCode(error)}`);
+          await this.clearPendingConfirmation(input.telegramId);
+          const reply = input.languageCode?.toLowerCase().startsWith('ru')
+            ? 'Не удалось завершить запись: это время уже заняли. Напишите желаемое время, и я проверю варианты.'
+            : 'Bandlovni yakunlay olmadim: bu vaqtni hozirgina band qilishdi. Boshqa vaqtni yozing, variantlarni tekshiraman.';
+          await this.prisma.chatMessage.create({
+            data: { telegramId: input.telegramId, role: 'assistant', content: reply },
+          });
+          return reply;
+        }
+        await this.clearPendingConfirmation(input.telegramId);
+        const reply = this.bookingConfirmationReply(
+          input.languageCode?.toLowerCase().startsWith('ru') ? 'ru' : 'uz',
+          result.clientConfirmationSent === true,
+        );
+        await this.prisma.chatMessage.create({
+          data: { telegramId: input.telegramId, role: 'assistant', content: reply },
+        });
+        return reply;
       }
 
       if (isBarberListRequest(input.text ?? '')) {
@@ -245,11 +332,13 @@ export class AiService implements ConversationHandler {
                 serviceId: Number(result.serviceId),
                 serviceNameRu: String(result.serviceNameRu ?? ''),
                 serviceNameUz: String(result.serviceNameUz ?? ''),
+                basePrice: Number(result.basePrice ?? 0),
                 startTimeIso: String(result.startTimeIso),
                 barberId: Number(result.barberId),
                 barberName: String(result.barberName ?? ''),
                 discountPercent: Number(result.maxDiscountPercent ?? 0),
                 finalPrice: Number(result.finalPriceAtMax ?? result.basePrice),
+                bonus: result.bonus ? String(result.bonus) : null,
                 expiresAt: Date.now() + PENDING_CONFIRMATION_TTL_MS,
               };
             }
@@ -285,11 +374,12 @@ export class AiService implements ConversationHandler {
         finalText = this.bookingConfirmationReply(clientLang, confirmationSent);
       }
 
-      if (
-        offerCandidate &&
-        explicitlyOffersConfirmation(finalText, offerCandidate)
-      ) {
+      if (offerCandidate) {
+        finalText = renderOfferConfirmation(offerCandidate, clientLang);
         await this.savePendingConfirmation(input.telegramId, offerCandidate);
+      }
+      if (confirmedOffer?.confirmed && !bookingCreated) {
+        await this.savePendingConfirmation(input.telegramId, confirmedOffer);
       }
 
       await this.prisma.chatMessage.create({
@@ -473,7 +563,7 @@ export class AiService implements ConversationHandler {
         function: {
           name: 'get_available_slots',
           description:
-            'Get free slots for a date (Asia/Tashkent) with max discount and available barber ids. If barberId is omitted, availability is aggregated across active barbers.',
+            'Get free slots for a date (Asia/Tashkent) with max discount and available barber ids. If barberId is omitted, availability is aggregated across active barbers. When the client gives an exact time, pass requestedTime and treat requestedSlot as authoritative for that exact time.',
           parameters: {
             type: 'object',
             properties: {
@@ -486,6 +576,10 @@ export class AiService implements ConversationHandler {
                 type: 'integer',
                 description:
                   'Optional service ID to return slots that fit its full duration',
+              },
+              requestedTime: {
+                type: 'string',
+                description: 'Optional exact requested time in HH:mm, for example 20:00. The response includes an authoritative requestedSlot result for this exact time.',
               },
               barberId: { type: 'integer', description: 'Optional barber ID. Omit to see aggregate availability and freeBarberIds.' },
             },
@@ -518,7 +612,7 @@ export class AiService implements ConversationHandler {
                   'ISO 8601 datetime with the Asia/Tashkent +05:00 offset, for example 2026-11-25T13:00:00+05:00. UTC Z is also accepted.',
               },
             },
-            required: ['serviceId', 'startTimeIso'],
+            required: ['serviceId', 'barberId', 'startTimeIso'],
             additionalProperties: false,
           },
         },
@@ -618,10 +712,11 @@ export class AiService implements ConversationHandler {
             daySlots.slots.map((slot: any) => [slot.startTimeIso, slot]),
           );
           const free = daySlots.slots
-            .filter((s: any) => {
+            .flatMap((s: any) => {
               const start = new Date(s.startTimeIso);
               if (s.status !== 'FREE' || start.getTime() <= Date.now())
-                return false;
+                return [];
+              let availableBarberIds: number[] = [...(s.freeBarberIds ?? [])];
               for (
                 let offset = 0;
                 offset < (service?.durationMin ?? 30);
@@ -631,26 +726,49 @@ export class AiService implements ConversationHandler {
                   start.getTime() + offset * 60_000,
                 ).toISOString();
                 const next = slotsByStart.get(nextStart) as any;
-                if (!next) return false;
-                if (values.barberId !== undefined && next.status !== 'FREE') return false;
-                if (values.barberId === undefined && !(s.freeBarberIds ?? []).some((id: number) => (next.freeBarberIds ?? []).includes(id))) return false;
+                if (!next) return [];
+                if (values.barberId !== undefined && next.status !== 'FREE') return [];
+                if (values.barberId === undefined) {
+                  availableBarberIds = availableBarberIds.filter((id) => (next.freeBarberIds ?? []).includes(id));
+                  if (!availableBarberIds.length) return [];
+                }
               }
-              return true;
-            })
-            .map((s: any) => ({
-              time: s.time,
-              startTimeIso: s.startTimeIso,
-              maxDiscountPercent: s.offer?.maxDiscountPercent ?? 0,
-              canDiscount: s.offer?.canDiscount ?? false,
-              bonus: s.offer?.bonus ?? null,
-              reason: s.offer?.reason ?? null,
-              freeBarberIds: s.freeBarberIds ?? [],
-              availableBarbers: barbers.filter((barber: any) => (s.freeBarberIds ?? []).includes(barber.id)),
-            }));
+              return [{
+                time: s.time,
+                startTimeIso: s.startTimeIso,
+                maxDiscountPercent: s.offer?.maxDiscountPercent ?? 0,
+                canDiscount: s.offer?.canDiscount ?? false,
+                bonus: s.offer?.bonus ?? null,
+                reason: s.offer?.reason ?? null,
+                freeBarberIds: availableBarberIds,
+                availableBarbers: barbers.filter((barber: any) => availableBarberIds.includes(barber.id)),
+              }];
+            });
+          const requestedTime = typeof values.requestedTime === 'string' ? values.requestedTime : undefined;
+          const requestedSlot = requestedTime
+            ? (() => {
+                const slot = daySlots.slots.find((item: any) => item.time === requestedTime);
+                const available = free.find((item: any) => item.time === requestedTime);
+                const slotIsPast = slot && new Date(slot.startTimeIso).getTime() <= Date.now();
+                return {
+                  time: requestedTime,
+                  status: available
+                    ? 'FREE'
+                    : slotIsPast
+                      ? 'PAST'
+                      : slot?.status === 'FREE'
+                        ? 'DOES_NOT_FIT_SERVICE_DURATION'
+                        : slot?.status ?? 'OUTSIDE_WORKING_HOURS',
+                  available: Boolean(available),
+                  availableBarbers: available?.availableBarbers ?? [],
+                };
+              })()
+            : undefined;
           return {
             date: daySlots.date,
             timezone: daySlots.timezone,
             barberId: values.barberId === undefined ? undefined : Number(values.barberId),
+            requestedSlot,
             freeSlots: free,
           };
         }
@@ -704,6 +822,9 @@ export class AiService implements ConversationHandler {
           if (!confirmedOffer || confirmedOffer.serviceId !== serviceId || confirmedOffer.barberId !== barberId || confirmedOffer.startTimeIso !== requestedStart.toISOString()) {
             return this.loggedToolError(name, iteration, 'The client has not confirmed this exact offer yet.', 'First quote the service, Tashkent date/time and final price, then ask the client to confirm. Create the booking only after a later affirmative reply.', 'confirmation_required');
           }
+          if (!input.contactPhone) {
+            return this.loggedToolError(name, iteration, 'The client phone number has not been shared.', 'Ask the client to share their own phone number using the Telegram contact attachment. Do not attempt to create the booking until a Telegram contact is received.', 'client_phone_required');
+          }
           const result = await this.bookingService.createBooking({
             serviceId,
             barberId,
@@ -711,9 +832,7 @@ export class AiService implements ConversationHandler {
             discountPercent: confirmedOffer.discountPercent,
             clientTelegramId: input.telegramId,
             clientName: input.firstName || (values.clientName ? String(values.clientName) : undefined),
-            clientPhone: values.clientPhone
-              ? String(values.clientPhone)
-              : input.contactPhone,
+            clientPhone: input.contactPhone,
             clientLang: input.detectedLanguage ?? this.detectClientLanguage(input),
           });
           return {

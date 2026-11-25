@@ -16,6 +16,7 @@ export type AppEnv = {
   GEMINI_REASONING_EFFORT: string;
   GEMINI_TIMEOUT_MS: number;
   BARBER_TELEGRAM_IDS: string[];
+  ADMIN_TELEGRAM_IDS: string[];
   ADMIN_KEY: string;
   MINI_APP_URL: string;
   NODE_ENV: string;
@@ -37,6 +38,10 @@ function readInt(name: string, fallback: number): number {
 
 export function getAppEnv(): AppEnv {
   const barberIds = read('BARBER_TELEGRAM_IDS')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const adminIds = read('ADMIN_TELEGRAM_IDS')
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean);
@@ -72,6 +77,7 @@ export function getAppEnv(): AppEnv {
     GEMINI_REASONING_EFFORT: reasoningEffortRaw,
     GEMINI_TIMEOUT_MS: readInt('GEMINI_TIMEOUT_MS', 25000),
     BARBER_TELEGRAM_IDS: barberIds,
+    ADMIN_TELEGRAM_IDS: adminIds,
     ADMIN_KEY: read('ADMIN_KEY'),
     MINI_APP_URL: read('MINI_APP_URL'),
     NODE_ENV: read('NODE_ENV', 'dev'),

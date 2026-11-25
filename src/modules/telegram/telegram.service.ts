@@ -5,7 +5,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { getAppEnv } from '../../common/config/env';
 import { BookingNotifier } from '../booking/booking-notifier';
 import {
@@ -157,6 +157,7 @@ export class TelegramService
     if (!this.bot) return;
     const env = getAppEnv();
     const barberIds = new Set(env.BARBER_TELEGRAM_IDS.map(String));
+    const adminIds = new Set(env.ADMIN_TELEGRAM_IDS.map(String));
 
     this.bot.command('start', async (ctx) => {
       const languageKeyboard = new InlineKeyboard()
@@ -214,7 +215,7 @@ export class TelegramService
         firstName: ctx.from?.first_name,
         contactPhone: phone,
       });
-      await ctx.reply(reply);
+      await ctx.reply(reply, { reply_markup: { remove_keyboard: true } });
     });
 
     this.bot.on('message:text', async (ctx) => {
@@ -245,7 +246,15 @@ export class TelegramService
           languageCode: await this.getPreferredLanguage(userId) ?? ctx.from?.language_code,
           firstName: ctx.from?.first_name,
         });
-        await ctx.reply(reply);
+        const asksForContact = /(kontakt.{0,50}(sifatida yubor|tugmasidan|ulash|yubor)|contact.{0,50}(share|send|button)|контакт.{0,50}(отправ|кноп|подел)|отправ.{0,30}контакт)/i.test(reply);
+        if (asksForContact) {
+          const lang = await this.getPreferredLanguage(userId) ?? (ctx.from?.language_code?.toLowerCase().startsWith('ru') ? 'ru' : 'uz');
+          const button = lang === 'ru' ? '📱 Отправить контакт' : '📱 Kontaktni yuborish';
+          const keyboard = new Keyboard().requestContact(button).resized().oneTime();
+          await ctx.reply(reply, { reply_markup: keyboard });
+        } else {
+          await ctx.reply(reply);
+        }
       } catch {
         this.logger.error('telegram_handler_failed');
         await ctx.reply(
@@ -265,16 +274,30 @@ export class TelegramService
             data: { telegramId, role: 'language_preference', content: lang },
           });
           await ctx.answerCallbackQuery({ text: lang === 'ru' ? 'Язык сохранён' : 'Til saqlandi' });
-          if (barberIds.has(telegramId)) {
+          const barber = await this.prisma.barber.findUnique({
+            where: { telegramId },
+            select: { id: true },
+          });
+          const isAdmin = adminIds.has(telegramId) || (barberIds.has(telegramId) && !barber);
+          if (barber || isAdmin) {
             const appUrl = this.getHttpsMiniAppUrl(env.MINI_APP_URL ?? '');
-            const text = lang === 'ru'
-              ? '👋 Добро пожаловать в SavdoAI, мастер! Здесь вы можете следить за записями и расписанием.'
-              : '👋 SavdoAI’ga xush kelibsiz, usta! Yozuvlaringiz va ish jadvalingizni shu yerdan kuzatib boring.';
+            const text = isAdmin
+              ? lang === 'ru'
+                ? '👋 Добро пожаловать в панель администратора SavdoAI. Откройте приложение, чтобы управлять расписанием барбершопа.'
+                : '👋 SavdoAI admin paneliga xush kelibsiz. Barbershop jadvalini boshqarish uchun ilovani oching.'
+              : lang === 'ru'
+                ? '👋 Добро пожаловать в SavdoAI, мастер! Здесь вы можете следить за записями и расписанием.'
+                : '👋 SavdoAI’ga xush kelibsiz, usta! Yozuvlaringiz va ish jadvalingizni shu yerdan kuzatib boring.';
             if (appUrl) {
-              const keyboard = new InlineKeyboard().webApp(lang === 'ru' ? '📊 Открыть расписание' : '📊 Jadvalni ochish', appUrl);
+              const buttonText = isAdmin
+                ? lang === 'ru' ? '⚙️ Открыть панель' : '⚙️ Admin panelni ochish'
+                : lang === 'ru' ? '📊 Открыть расписание' : '📊 Jadvalni ochish';
+              const keyboard = new InlineKeyboard().webApp(buttonText, appUrl);
               await ctx.reply(text, { reply_markup: keyboard });
             } else {
-              await ctx.reply(text);
+              await ctx.reply(lang === 'ru'
+                ? `${text}\n\nСсылка Mini App не настроена. В dev-режиме укажите в MINI_APP_URL HTTPS-ссылку на ваш frontend.`
+                : `${text}\n\nMini App havolasi sozlanmagan. Dev rejimida MINI_APP_URL ga frontend uchun HTTPS havola kiriting.`);
             }
             return;
           }
