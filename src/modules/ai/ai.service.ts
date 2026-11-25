@@ -130,10 +130,6 @@ function isBarberListRequest(text: string): boolean {
 export class AiService implements ConversationHandler {
   private readonly logger = new Logger(AiService.name);
   private readonly llm: LlmClient;
-  private readonly pendingConfirmations = new Map<
-    string,
-    PendingBookingConfirmation
-  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -147,19 +143,21 @@ export class AiService implements ConversationHandler {
     const userText = this.composeUserText(input);
     const startedAt = Date.now();
     let iteration = 0;
-    const pending = this.pendingConfirmations.get(input.telegramId);
-    const confirmedOffer =
-      pending && pending.expiresAt > Date.now() && isAffirmative(userText)
-        ? pending
-        : undefined;
-    if (pending && !confirmedOffer) {
-      this.pendingConfirmations.delete(input.telegramId);
-    }
+    let confirmedOffer: PendingBookingConfirmation | undefined;
     let offerCandidate: PendingBookingConfirmation | undefined;
     try {
       await this.prisma.chatMessage.create({
         data: { telegramId: input.telegramId, role: 'user', content: userText },
       });
+
+      const pending = await this.loadPendingConfirmation(input.telegramId);
+      confirmedOffer =
+        pending && pending.expiresAt > Date.now() && isAffirmative(userText)
+          ? pending
+          : undefined;
+      if (pending && !confirmedOffer) {
+        await this.clearPendingConfirmation(input.telegramId);
+      }
 
       if (isBarberListRequest(input.text ?? '')) {
         const barbers = await this.bookingService.listBarbers();
@@ -259,7 +257,7 @@ export class AiService implements ConversationHandler {
               tc.function.name === 'create_booking' &&
               result?.ok === true
             ) {
-              this.pendingConfirmations.delete(input.telegramId);
+              await this.clearPendingConfirmation(input.telegramId);
               bookingCreated = true;
               confirmationSent = result.confirmationSent === true;
             }
@@ -291,7 +289,7 @@ export class AiService implements ConversationHandler {
         offerCandidate &&
         explicitlyOffersConfirmation(finalText, offerCandidate)
       ) {
-        this.pendingConfirmations.set(input.telegramId, offerCandidate);
+        await this.savePendingConfirmation(input.telegramId, offerCandidate);
       }
 
       await this.prisma.chatMessage.create({
@@ -336,6 +334,50 @@ export class AiService implements ConversationHandler {
       return `[Client shared phone number: ${input.contactPhone}] ${input.text || ''}`.trim();
     }
     return input.text || '';
+  }
+
+  private async loadPendingConfirmation(
+    telegramId: string,
+  ): Promise<PendingBookingConfirmation | undefined> {
+    const [record] = await this.prisma.chatMessage.findMany({
+      where: { telegramId, role: 'pending_booking_confirmation' },
+      orderBy: { createdAt: 'desc' },
+      take: 1,
+    });
+    if (!record) return undefined;
+    try {
+      const offer = JSON.parse(record.content) as PendingBookingConfirmation;
+      if (!offer || typeof offer.expiresAt !== 'number') {
+        await this.clearPendingConfirmation(telegramId);
+        return undefined;
+      }
+      return offer;
+    } catch {
+      await this.clearPendingConfirmation(telegramId);
+      return undefined;
+    }
+  }
+
+  private async savePendingConfirmation(
+    telegramId: string,
+    offer: PendingBookingConfirmation,
+  ): Promise<void> {
+    await this.prisma.chatMessage.deleteMany({
+      where: { telegramId, role: 'pending_booking_confirmation' },
+    });
+    await this.prisma.chatMessage.create({
+      data: {
+        telegramId,
+        role: 'pending_booking_confirmation',
+        content: JSON.stringify(offer),
+      },
+    });
+  }
+
+  private async clearPendingConfirmation(telegramId: string): Promise<void> {
+    await this.prisma.chatMessage.deleteMany({
+      where: { telegramId, role: 'pending_booking_confirmation' },
+    });
   }
 
   private detectClientLanguage(input: ConversationInput, history: string[] = []): 'uz' | 'ru' {
