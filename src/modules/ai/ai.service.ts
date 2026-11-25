@@ -76,10 +76,29 @@ function explicitlyOffersConfirmation(
   const timeMentioned = normalized.includes(time) || normalized.includes(time.replace(':', '.'));
   const date = formatTashkentDate(start);
   const [year, month, day] = date.split('-');
+  const uzbekMonths = [
+    ['yanvar'],
+    ['fevral'],
+    ['mart'],
+    ['aprel'],
+    ['may'],
+    ['iyun'],
+    ['iyul'],
+    ['avgust'],
+    ['sentabr', 'sentyabr'],
+    ['oktabr', 'oktyabr'],
+    ['noyabr'],
+    ['dekabr'],
+  ];
+  const monthNameMentioned = (uzbekMonths[Number(month) - 1] ?? []).some(
+    (monthName) =>
+      new RegExp(`\\b${day}[-\\s.]*(?:${monthName})\\b`, 'i').test(normalized),
+  );
   const dateMentioned =
     normalized.includes(date) ||
     normalized.includes(`${day}.${month}.${year}`) ||
     normalized.includes(`${day}.${month}`) ||
+    monthNameMentioned ||
     /\b(ertaga|tomorrow|завтра)\b/i.test(normalized);
   return (
     asksToConfirm &&
