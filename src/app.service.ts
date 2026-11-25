@@ -8,7 +8,7 @@ import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 
 export class App {
   static readonly prod = isProd();
-  static readonly HOST = this.prod ? '0.0.0.0' : 'localhost';
+  static readonly HOST = '0.0.0.0';
   static readonly api = 'api/v1';
 
   static async main() {
